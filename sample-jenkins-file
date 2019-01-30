@@ -1,0 +1,275 @@
+#!/usr/bin/env groovy
+
+// Define DevCloud Artifactory for publishing non-docker image artifacts
+def artUploadServer = Artifactory.server('devcloud')
+
+// Change Snapshot to your own DevCloud Artifactory repo name
+def Snapshot = 'OQRWN'
+
+pipeline {
+    agent none
+    environment {
+        COMPLIANCEENABLED = true
+    }
+    options {
+        skipDefaultCheckout()
+        buildDiscarder(logRotator(artifactDaysToKeepStr: '1', artifactNumToKeepStr: '1', daysToKeepStr: '5', numToKeepStr: '10'))
+    }
+    stages {
+        stage('PR') {
+            agent {
+                docker {
+                    image 'maven:3.5'
+                    label 'dind'
+                    args '-v /root/.m2:/root/.m2'
+                }
+            }
+            steps {
+                checkout scm
+                sh'''#!/bin/sh
+                    set -e
+                    set -x
+
+                    if ! [[ $ghprbPullTitle =~ \[(US|DE)[0-9]+\].+ ]]
+                    then
+                        echo "Your PR Title must match the pattern `[USxxx/DExxx] story title`"
+                        exit 1
+                    fi
+
+                    mvn -B -s "$MAVEN_SETTINGS" clean verify
+                    mvn -B -s "$MAVEN_SETTINGS" sonar:sonar -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.analysis.mode=preview -Dsonar.github.repository=$ghprbGhRepository -Dsonar.github.pullRequest=$ghprbPullId -Dsonar.github.endpoint=https://github.build.ge.com/api/v3 -Dsonar.github.login=$GITHUB_SSO -Dsonar.github.oauth=$GITHUB_TOKEN -Dsonar.projectKey=smart-shop-$JOB_BASE_NAME  -Dsonar.projectBaseDir="$WORKSPACE"
+                '''
+                }
+                            }
+            post {
+                always {
+                    deleteDir()
+                }
+                success {
+                    echo "PR stage completed"
+                }
+                failure {
+                    echo "PR stage failed"
+                }
+            }
+        }
+        stage('Build'){
+            agent {
+                docker {
+                    image 'maven:3.5'
+                    label 'dind'
+                    args '-v /root/.m2:/root/.m2'
+                }
+            }
+            //when {
+            //     ''}
+            }
+            steps {
+                // OLD
+                /*checkout scm
+                sh 'mvn -B -s settings.xml -DskipTests clean install'
+                stash includes: 'target/*.jar', name: 'artifact'
+                */
+
+                // NEW
+                checkout scm
+                sh'''#!/bin/sh
+                    set -e
+                    set -x
+
+                    mvn -B -s "$MAVEN_SETTINGS" build-helper:parse-version versions:set -DnewVersion="${parsedVersion.majorVersion}.${parsedVersion.nextMinorVersion}.0" -DprocessAllModules=true versions:commit
+                    mvn -B -s "$MAVEN_SETTINGS" -Dmessage="[skip-ci] Incremented version to ${project.version}" -Dtag="${project.version}" -DdeveloperConnectionUrl="scm:git:https://$GITHUB_TOKEN@github.build.ge.com/smart-shop/$JOB_BASE_NAME.git" -DconnectionType=developerConnection scm:checkin scm:tag
+
+                    mvn -B -s "$MAVEN_SETTINGS" clean install
+
+                    mvn -B -s "$MAVEN_SETTINGS" deploy -DskipTests=false'''
+                stash includes: 'target/*.jar', name: 'artifact'
+
+            }
+            post {
+                always {
+                    deleteDir()
+                }
+                success {
+                    echo "Build stage completed"
+                }
+                failure {
+                    echo "Build stage failed"
+                }
+            }
+
+        }
+        stage('SonarQube check') {
+            agent {
+                docker {
+                    image 'maven:3.5'
+                    label 'dind'
+                    args '-v /root/.m2:/root/.m2'
+                }
+            }
+            steps{
+                checkout scm
+                sh'''#!/bin/sh
+                    set -e
+                    set -x
+                    // Run SonarQube here
+                    // Copy from PR stage
+                    mvn -B -s "$MAVEN_SETTINGS" sonar:sonar -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.projectKey=smart-shop-$JOB_BASE_NAME'''
+            }
+            post {
+                success {
+                    echo "SonarQube check stage completed"
+                }
+                failure {
+                    echo "SonarQube check stage failed"
+                }
+                always {
+                    deleteDir()
+                }
+        }
+        stage('WhiteSource'){
+            agent {
+                docker {
+                    image 'maven:3.5'
+                    label 'dind'
+                    args '-v /root/.m2:/root/.m2'
+                }
+            }
+            steps{
+                checkout scm
+                sh'''#!/bin/sh
+                    set -e
+                    set -x
+                    #WhiteSource Scan
+                    mvn -B -s "$MAVEN_SETTINGS" whitesource:update -Dorg.whitesource.autoDetectProxySettings=true \
+                    -DwhitesourceOrgToken=${WS_ORGTOKEN} \
+                    -Dwss.url="https://ws.ci.build.ge.com/agent" \
+                    -Dorg.whitesource.product="faeadca4-ffe3-4872-9416-1e33eb286452" \ -Dorg.whitesource.forceUpdate=true'''
+            }
+            post {
+                success {
+                    echo "SonarQube check stage completed"
+                }
+                failure {
+                    echo "SonarQube check stage failed"
+                }
+                always {
+                    deleteDir()
+                }
+            }
+        }
+        stage('Publish Artifact'){
+            // script: Target nem paraméterezett
+            agent {
+                label 'dind'
+            }
+            steps {
+                checkout scm
+                unstash 'artifact'
+                sh 'ls -ltr'
+                sh 'ls -ltr target'
+                stash includes: 'target/*.jar', name: 'artifact2'
+                script {
+                    echo 'Publishing Artifacts to Artifactory'
+                    def uploadSpec = """{
+                        "files": [
+                            {
+                                "pattern": "target/*.jar",
+                                "target": "${Snapshot}/predix-cicd-java-sample/"
+                            }
+                        ]
+                    }"""
+                    def buildInfo = artUploadServer.upload(uploadSpec)
+                    artUploadServer.publishBuildInfo(buildInfo)
+                }
+            }
+            post {
+                success {
+                    echo "Publish Artifacts stage completed"
+                }
+                failure {
+                    echo "Publish Artifacts stage failed"
+                }
+                always {
+                    deleteDir()
+                }
+        }
+        /*
+        stage('Deploy'){
+            agent {
+                docker {
+                    image 'nulldriver/cf-cli-resource'
+                    label 'dind'
+                }
+            }
+            environment {
+                CLOUD_FOUNDRY = credentials('ge-predix')
+                CF_Org = 'smart-shop'
+                CF_Space = 'smart-shop-dev'
+            }
+            steps {
+            // OLD
+            /*
+                checkout scm
+                unstash 'artifact2'
+                sh 'cat manifest.yml'
+                sh 'ls -ltr target'
+                echo 'Pushing to Cloud Foundry'
+                sh "cf login -a https://api.system.aws-usw02-pr.ice.predix.io -u $CLOUD_FOUNDRY_USR -p $CLOUD_FOUNDRY_PSW -o ${env.CF_Org} -s ${env.CF_Space}"
+                sh 'cf push'
+                sh 'cf a'
+            
+            //NEW
+                checkout scm
+                sh'''#!/bin/sh
+                set -x
+                set +e
+                export CF_HOME="$WORKSPACE/.predix"
+                mkdir -p "$CF_HOME"
+
+                INSTANCE_COUNT=2
+
+                #get version
+                if [ -x "$(command -v xpath)" ]; then
+                    VERSION=$(xpath pom.xml "./project/version/text()" 2> /dev/null)
+                else
+                    VERSION=$(mvn -B org.apache.maven.plugins:maven-help-plugin:evaluate -Dexpression=project.version |grep -Ev "(^\[|Download\w+:)")
+                fi
+                echo "Application Version: "$VERSION
+
+                function checkExists() {
+                    RESULT=$(ls | grep $1)
+                }
+
+                RESULT=$JOB_BASE_NAME-service
+                if [ ! -d "$JOB_BASE_NAME-service" ]; then
+                    RESULT=.
+                fi
+
+                echo $RESULT
+                rm -rf $RESULT/target
+                mkdir -p $RESULT/target
+
+                set -e
+                echo "Downloading artifact..."
+                wget -nv --user $ART_USER --password $ART_PASSWORD "https://devcloud.swcoe.ge.com/artifactory/PS-JAVA/com/ge/digital/smartshop/$JOB_BASE_NAME-service/$VERSION/$JOB_BASE_NAME-service-$VERSION.jar" -O $RESULT/target/$JOB_BASE_NAME-service.jar
+                echo 'Logging into Predix...'
+                cf login -a https://api.system.aws-usw02-pr.ice.predix.io -u $CF_USER -p $CF_PASSWORD -o "smart-shop" -s "smart-shop-dev"
+                if [ -f push.sh ]; then
+                    echo 'Push script found. Starting push...'
+                    . ./push.sh $INSTANCE_COUNT '''
+            }
+            post {
+                success {
+                    echo "Deploy stage completed"
+                }
+                failure {
+                    echo "Deploy stage failed"
+                }
+                always {
+                    deleteDir()
+                }
+            }
+        }*/
+    }
+}
